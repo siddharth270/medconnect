@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { supabase } from '../lib/supabase';
-import { Stethoscope, Heart, User, ArrowRight, Building2, BadgeCheck, Link2 } from 'lucide-react';
+import { Stethoscope, Heart, User, ArrowRight, Building2, BadgeCheck } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 export default function SetupProfilePage() {
@@ -19,7 +18,6 @@ export default function SetupProfilePage() {
     date_of_birth: '',
     gender: '',
     blood_group: '',
-    doctor_email: '',
   });
   const [loading, setLoading] = useState(false);
 
@@ -55,33 +53,7 @@ export default function SetupProfilePage() {
       }
 
       await createProfile(profileData);
-
-      // If patient provided a doctor's email, auto-link
-      if (role === 'patient' && form.doctor_email.trim()) {
-        try {
-          const { data, error } = await supabase.rpc('link_patient_to_doctor', {
-            p_doctor_email: form.doctor_email.trim().toLowerCase(),
-            p_patient_user_id: user.id,
-            p_full_name: form.full_name,
-            p_phone: form.phone || null,
-            p_gender: form.gender || null,
-            p_date_of_birth: form.date_of_birth || null,
-            p_blood_group: form.blood_group || null,
-          });
-
-          if (data?.success) {
-            toast.success(data.message || 'Linked to your doctor!');
-          } else {
-            toast.error(data?.error || 'Could not find doctor. You can link later.');
-          }
-        } catch (linkErr) {
-          console.warn('Doctor linking failed:', linkErr);
-          toast('Could not link to doctor. You can connect later.', { icon: '⚠️' });
-        }
-      } else {
-        toast.success('Profile created!');
-      }
-
+      toast.success('Profile created!');
       navigate(role === 'doctor' ? '/doctor' : '/patient', { replace: true });
     } catch (err) {
       toast.error(err.message || 'Failed to create profile');
@@ -225,21 +197,6 @@ export default function SetupProfilePage() {
                     <option value="">Select</option>
                     {['A+','A-','B+','B-','AB+','AB-','O+','O-'].map(g => <option key={g} value={g}>{g}</option>)}
                   </select>
-                </div>
-                <div className="pt-2 border-t border-surface-200">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Link2 size={14} className="text-brand-400" />
-                    <label className="text-xs text-brand-400 font-medium uppercase tracking-wider">Connect to Your Doctor</label>
-                  </div>
-                  <input
-                    type="email" placeholder="Enter your doctor's email address"
-                    value={form.doctor_email}
-                    onChange={(e) => setForm({ ...form, doctor_email: e.target.value })}
-                    className="w-full"
-                  />
-                  <p className="text-[10px] text-gray-600 mt-1">
-                    Your doctor will be able to see your records. You can also connect later.
-                  </p>
                 </div>
               </>
             )}

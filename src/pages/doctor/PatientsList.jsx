@@ -16,7 +16,7 @@ export default function PatientsList() {
 
   async function loadPatients() {
     try {
-      const data = await getPatients(profile.id);
+      const data = await getPatients();
       setPatients(data);
     } catch (err) {
       console.error(err);

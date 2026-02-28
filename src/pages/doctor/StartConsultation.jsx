@@ -26,7 +26,7 @@ export default function StartConsultation() {
 
   async function loadPatients() {
     try {
-      const data = await getPatients(profile.id);
+      const data = await getPatients();
       setPatients(data);
       if (preselectedPatientId) {
         const found = data.find(p => p.id === preselectedPatientId);

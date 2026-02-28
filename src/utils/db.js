@@ -2,11 +2,10 @@ import { supabase } from '../lib/supabase';
 
 // ── Patient Operations ──
 
-export async function getPatients(doctorId) {
+export async function getPatients() {
   const { data, error } = await supabase
     .from('patients')
     .select('*')
-    .eq('doctor_id', doctorId)
     .order('created_at', { ascending: false });
   if (error) throw error;
   return data;
@@ -255,7 +254,7 @@ export async function getAudioUrl(path) {
 
 export async function getDoctorStats(doctorId) {
   const [patients, upcoming, completed, today] = await Promise.all([
-    supabase.from('patients').select('id', { count: 'exact' }).eq('doctor_id', doctorId),
+    supabase.from('patients').select('id', { count: 'exact' }),
     supabase
       .from('appointments')
       .select('id', { count: 'exact' })

@@ -23,7 +23,7 @@ export default function DoctorDashboard() {
     try {
       const [statsData, patientsData] = await Promise.all([
         getDoctorStats(profile.id),
-        getPatients(profile.id),
+        getPatients(),
       ]);
       setStats(statsData);
       setRecentPatients(patientsData.slice(0, 5));
