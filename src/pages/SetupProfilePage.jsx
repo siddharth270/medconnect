@@ -78,7 +78,7 @@ export default function SetupProfilePage() {
           </h1>
           <p className="text-gray-500 text-sm mt-1">
             {step === 1
-              ? 'How will you use MedConnect?'
+              ? 'How will you use DOCITRON?'
               : `Set up your ${role} profile`}
           </p>
         </div>

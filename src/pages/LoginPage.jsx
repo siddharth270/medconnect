@@ -73,7 +73,7 @@ export default function LoginPage() {
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-brand-500 to-mint flex items-center justify-center mb-4 shadow-lg shadow-brand-500/25">
             <Stethoscope size={28} className="text-white" />
           </div>
-          <h1 className="font-display text-3xl font-bold tracking-tight">MedConnect</h1>
+          <h1 className="font-display text-3xl font-bold tracking-tight">DOCITRON</h1>
           <p className="text-gray-500 text-sm mt-1">Clinical consultation platform</p>
         </div>
 

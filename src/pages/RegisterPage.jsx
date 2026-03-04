@@ -73,7 +73,7 @@ export default function RegisterPage() {
 
         <div className="mb-8">
           <h1 className="font-display text-2xl font-bold">Create Account</h1>
-          <p className="text-gray-500 text-sm mt-1">Join MedConnect as a doctor or patient</p>
+          <p className="text-gray-500 text-sm mt-1">Join DOCITRON as a doctor or patient</p>
         </div>
 
         {/* OAuth Providers */}
