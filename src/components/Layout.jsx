@@ -48,7 +48,7 @@ export default function Layout() {
               <Stethoscope size={16} className="text-white" />
             </div>
             <div>
-              <h1 className="font-display font-semibold text-sm leading-tight">MedConnect</h1>
+              <h1 className="font-display font-semibold text-sm leading-tight">DOCITRON</h1>
               <p className="text-[10px] text-gray-500 uppercase tracking-widest">
                 {profile?.role}
               </p>
