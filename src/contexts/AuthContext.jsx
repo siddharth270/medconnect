@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useState, useRef } from 'react';
 import { supabase } from '../lib/supabase';
 
 const AuthContext = createContext({});
@@ -9,32 +9,72 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
+  const fetchingRef = useRef(false);
 
   useEffect(() => {
-    // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null);
-      if (session?.user) fetchProfile(session.user.id);
-      else setLoading(false);
-    });
+    let mounted = true;
 
-    // Listen for auth changes
+    // Safety timeout — never stay loading forever
+    const safetyTimer = setTimeout(() => {
+      if (mounted && loading) {
+        console.warn('Auth loading timeout — forcing complete');
+        setLoading(false);
+      }
+    }, 5000);
+
+    // Get initial session
+    async function init() {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!mounted) return;
+
+        const currentUser = session?.user ?? null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          await fetchProfile(currentUser.id);
+        }
+      } catch (err) {
+        console.error('Auth init error:', err);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    }
+
+    init();
+
+    // Listen for auth changes (login, logout, token refresh)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (_event, session) => {
-        setUser(session?.user ?? null);
-        if (session?.user) {
-          await fetchProfile(session.user.id);
+      async (event, session) => {
+        if (!mounted) return;
+
+        const currentUser = session?.user ?? null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          // Only fetch profile on sign-in events, not token refreshes
+          if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+            await fetchProfile(currentUser.id);
+          }
         } else {
           setProfile(null);
-          setLoading(false);
         }
+        setLoading(false);
       }
     );
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      clearTimeout(safetyTimer);
+      subscription.unsubscribe();
+    };
   }, []);
 
   async function fetchProfile(userId) {
+    // Prevent duplicate concurrent fetches
+    if (fetchingRef.current) return;
+    fetchingRef.current = true;
+
     try {
       const { data, error } = await supabase
         .from('profiles')
@@ -42,12 +82,15 @@ export function AuthProvider({ children }) {
         .eq('id', userId)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
-      setProfile(data);
+      if (error && error.code !== 'PGRST116') {
+        console.error('Profile fetch error:', error.message);
+      }
+      setProfile(data || null);
     } catch (err) {
-      console.error('Error fetching profile:', err);
+      console.error('Profile fetch failed:', err);
+      setProfile(null);
     } finally {
-      setLoading(false);
+      fetchingRef.current = false;
     }
   }
 
