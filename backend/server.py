@@ -1,39 +1,40 @@
 """
-MedConnect AI Backend
-FastAPI server that uses Ollama (Llama 3.2) for medical transcript processing.
-Generates SOAP notes and prescriptions from doctor-patient consultation transcripts.
+MedConnect AI Backend v3
+FastAPI + Anthropic Claude API for medical transcript processing.
+Claude Sonnet provides superior extraction accuracy for medical data.
 
 Setup:
-  1. Install Ollama: https://ollama.com/download
-  2. Pull model: ollama pull llama3.2
-  3. pip install -r requirements.txt
-  4. python server.py
+  1. Get API key: https://console.anthropic.com/settings/keys
+  2. pip install -r requirements.txt
+  3. ANTHROPIC_API_KEY=sk-ant-xxx python server.py
+
+Deploy (Render):
+  Set ANTHROPIC_API_KEY in environment variables.
 """
 
-import json
-import re
-import httpx
+import json, re, os
+import anthropic
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-app = FastAPI(title="MedConnect AI", version="1.0.0")
-
-# Allow frontend to connect
+app = FastAPI(title="MedConnect AI", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3.2"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+MODEL = "claude-sonnet-4-20250514"
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 
-# ── Request/Response Models ──
+# ── Models ──
 
 class PatientInfo(BaseModel):
     full_name: str = ""
@@ -82,251 +83,343 @@ class PrescriptionResponse(BaseModel):
     follow_up_days: int = 7
 
 
-# ── Ollama Communication ──
+# ══════════════════════════════════════════════════════════════
+# CLAUDE API
+# ══════════════════════════════════════════════════════════════
 
-async def query_ollama(prompt: str, system: str = "") -> str:
-    """Send a prompt to Ollama and return the response text."""
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "system": system,
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 2048,
-        }
-    }
+def query_claude(system: str, user_prompt: str) -> str:
+    """Call Claude API and return the response text."""
+    if not client:
+        raise HTTPException(503, "ANTHROPIC_API_KEY not set.")
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(OLLAMA_URL, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "")
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail="Ollama is not running. Start it with: ollama serve"
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=system,
+            messages=[{"role": "user", "content": user_prompt}],
+            temperature=0.0,  # deterministic for structured extraction
         )
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Ollama request timed out. The model may still be loading."
-        )
+        return response.content[0].text
+    except anthropic.AuthenticationError:
+        raise HTTPException(401, "Invalid Anthropic API key.")
+    except anthropic.RateLimitError:
+        raise HTTPException(429, "Anthropic rate limit hit. Try again shortly.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
+        raise HTTPException(500, f"Claude API error: {str(e)}")
 
 
 def extract_json(text: str) -> dict:
-    """Extract a JSON object from LLM response text."""
-    # Try to find JSON block
-    json_match = re.search(r'\{[\s\S]*\}', text)
-    if json_match:
-        try:
-            return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            pass
+    """Robustly extract JSON from Claude's response."""
+    # Strategy 1: Find outermost balanced braces
+    depth = 0; start = -1
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0: start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidate = text[start:i+1]
+                candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    start = -1; continue
 
-    # Try cleaning common issues
+    # Strategy 2: Strip markdown fences
     cleaned = text.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
-
+    for prefix in ["```json", "```JSON", "```"]:
+        if cleaned.startswith(prefix): cleaned = cleaned[len(prefix):]
+    if cleaned.endswith("```"): cleaned = cleaned[:-3]
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        return json.loads(cleaned.strip())
+    except:
         return {}
 
 
-# ── API Endpoints ──
+# ══════════════════════════════════════════════════════════════
+# PRESCRIPTION ENDPOINT
+# ══════════════════════════════════════════════════════════════
 
-@app.get("/health")
-async def health_check():
-    """Check if server and Ollama are running."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get("http://localhost:11434/api/tags")
-            models = resp.json().get("models", [])
-            model_names = [m["name"] for m in models]
-            has_model = any(MODEL in name for name in model_names)
-            return {
-                "status": "ok",
-                "ollama": "connected",
-                "model": MODEL,
-                "model_available": has_model,
-                "available_models": model_names,
-            }
-    except Exception:
-        return {
-            "status": "degraded",
-            "ollama": "not connected",
-            "message": "Start Ollama with: ollama serve",
-        }
+PRESCRIPTION_SYSTEM = """You are an expert medical scribe AI. Your job is to extract structured prescription data from a doctor-patient consultation transcript.
 
+You MUST output ONLY a valid JSON object. No markdown fences, no explanation, no preamble — just raw JSON.
 
-@app.post("/api/soap", response_model=SOAPResponse)
-async def generate_soap_note(req: SOAPRequest):
-    """Generate a SOAP note from a consultation transcript."""
+The JSON schema is:
+{
+  "diagnosis": "Primary diagnosis as a clear clinical statement",
+  "medications": [
+    {
+      "medication_name": "Drug name (capitalize first letter)",
+      "dosage": "Exact dose with unit, e.g. '20mg', '500mg', '1g', '5ml'",
+      "frequency": "Exactly one of: 'Once daily', 'Twice daily', 'Three times daily', 'Four times daily', 'Every 6 hours', 'Every 8 hours', 'Every 12 hours', 'As needed', 'Once daily (morning)', 'Once daily (bedtime)'",
+      "duration": "e.g. '7 days', '14 days', '2 weeks', '1 month', 'Ongoing'",
+      "route": "Exactly one of: 'oral', 'topical', 'injection', 'inhalation', 'sublingual', 'rectal', 'ophthalmic', 'nasal', 'transdermal'",
+      "instructions": "Specific instructions like 'Take before breakfast', 'Take 30 minutes before meals', 'Take with food', 'Take on empty stomach'. Include tablet/capsule form if mentioned."
+    }
+  ],
+  "notes": "All lifestyle advice, dietary restrictions, warning signs, and non-medication instructions. Combine into a clear paragraph.",
+  "follow_up_days": 14
+}
 
-    system_prompt = """You are a medical scribe AI assistant. Your job is to analyze doctor-patient consultation transcripts and generate structured SOAP notes.
-
-You MUST respond with ONLY a valid JSON object — no markdown, no explanation, no preamble. Just pure JSON.
-
-The JSON must have these exact keys:
-- "subjective": Patient's reported symptoms, concerns, history of present illness
-- "objective": Clinical findings, vital signs, physical examination results
-- "assessment": Diagnosis, differential diagnosis, clinical impression
-- "plan": Treatment plan, medications, follow-up instructions, referrals
-- "icd_codes": Array of relevant ICD-10 codes (e.g. ["K29.70", "R11.0"])
-- "follow_up_days": Number of days until follow-up (integer)
-
-Be thorough, professional, and use proper medical terminology."""
-
-    patient = req.patient
-    vitals = []
-    if patient.blood_pressure:
-        vitals.append(f"BP {patient.blood_pressure}")
-    if patient.heart_rate:
-        vitals.append(f"HR {patient.heart_rate} bpm")
-    if patient.temperature:
-        vitals.append(f"Temp {patient.temperature}°F")
-    if patient.oxygen_sat:
-        vitals.append(f"SpO2 {patient.oxygen_sat}%")
-
-    prompt = f"""Analyze this consultation transcript and generate a SOAP note as JSON.
-
-Patient: {patient.full_name}, Age: {patient.age or 'N/A'}, Gender: {patient.gender or 'N/A'}
-Vitals: {', '.join(vitals) if vitals else 'N/A'}
-Allergies: {', '.join(patient.allergies) if patient.allergies else 'None known'}
-Medical History: {patient.medical_history or 'N/A'}
-
-TRANSCRIPT:
-{req.transcript}
-
-Respond with ONLY a JSON object:"""
-
-    response_text = await query_ollama(prompt, system_prompt)
-    parsed = extract_json(response_text)
-
-    if not parsed:
-        # Fallback: use the transcript as-is
-        return SOAPResponse(
-            subjective=f"Patient reports: {req.transcript[:500]}",
-            objective="Vitals as recorded. Physical examination performed.",
-            assessment="Assessment pending physician review.",
-            plan="Plan to be determined.",
-            icd_codes=[],
-            follow_up_days=14,
-        )
-
-    return SOAPResponse(
-        subjective=parsed.get("subjective", ""),
-        objective=parsed.get("objective", ""),
-        assessment=parsed.get("assessment", ""),
-        plan=parsed.get("plan", ""),
-        icd_codes=parsed.get("icd_codes", []),
-        follow_up_days=parsed.get("follow_up_days", 14),
-    )
+CRITICAL RULES:
+1. Extract EVERY medication mentioned in the transcript — do not skip any.
+2. Convert spoken dosages to standard format: "twenty milligrams" → "20mg", "one gram" → "1g".
+3. Convert spoken frequencies: "twice a day" → "Twice daily", "three times a day" → "Three times daily".
+4. Capture ALL special instructions: timing relative to meals, warnings, maximum doses.
+5. Put dietary advice, lifestyle changes, and red-flag warnings in "notes" — not in medication instructions.
+6. For follow_up_days, extract the exact number from the transcript. "two weeks" = 14, "one week" = 7, "one month" = 30.
+7. If a medication detail is not explicitly stated, use empty string "" — never guess.
+8. The diagnosis should be a clear medical assessment, not just "stomach pain" but the actual clinical diagnosis like "Acute gastritis".
+"""
 
 
 @app.post("/api/prescription", response_model=PrescriptionResponse)
-async def generate_prescription(req: PrescriptionRequest):
+async def api_prescription(req: PrescriptionRequest):
     """Generate a prescription from a consultation transcript."""
+    p = req.patient
+    allergies = ", ".join(p.allergies) if p.allergies else "No known allergies"
 
-    system_prompt = """You are a medical AI assistant that extracts prescription details from doctor-patient consultation transcripts.
+    user_prompt = f"""Extract the prescription from this consultation transcript.
 
-You MUST respond with ONLY a valid JSON object — no markdown, no explanation, no preamble. Just pure JSON.
+PATIENT INFO:
+- Name: {p.full_name or 'Unknown'}
+- Age: {p.age or 'N/A'}
+- Gender: {p.gender or 'N/A'}
+- Allergies: {allergies}
 
-The JSON must have these exact keys:
-- "diagnosis": The primary diagnosis as a string
-- "medications": Array of medication objects, each with:
-    - "medication_name": Drug name
-    - "dosage": Dose amount and unit (e.g. "20mg", "500mg", "1g")
-    - "frequency": How often (e.g. "Once daily", "Twice daily", "Three times daily", "As needed")
-    - "duration": How long (e.g. "7 days", "14 days", "2 weeks")
-    - "route": Administration route (e.g. "oral", "topical", "injection", "inhalation")
-    - "instructions": Special instructions (e.g. "Take before breakfast", "Take with food")
-- "notes": Additional clinical notes, dietary advice, lifestyle recommendations, warnings
-- "follow_up_days": Number of days until follow-up (integer)
+DOCTOR INFO:
+- Name: {req.doctor.full_name or 'N/A'}
+- Specialization: {req.doctor.specialization or 'General Practice'}
 
-Extract ALL medications mentioned. Be precise with dosages and frequencies."""
-
-    patient = req.patient
-    prompt = f"""Extract the prescription from this consultation transcript as JSON.
-
-Doctor: {req.doctor.full_name or 'N/A'}, {req.doctor.specialization or 'General Practice'}
-Patient: {patient.full_name}, Age: {patient.age or 'N/A'}
-Allergies: {', '.join(patient.allergies) if patient.allergies else 'None known'}
-
-TRANSCRIPT:
+CONSULTATION TRANSCRIPT:
+\"\"\"
 {req.transcript}
+\"\"\"
 
-Respond with ONLY a JSON object:"""
+Extract all medications, diagnosis, notes, and follow-up into the JSON format specified. Output ONLY the JSON object:"""
 
-    response_text = await query_ollama(prompt, system_prompt)
-    parsed = extract_json(response_text)
+    try:
+        response_text = query_claude(PRESCRIPTION_SYSTEM, user_prompt)
+        parsed = extract_json(response_text)
+        print(f"[Rx] Claude extracted: {len(parsed.get('medications', []))} medications")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Rx] Claude failed: {e}")
+        parsed = {}
 
-    if not parsed:
+    if not parsed or not parsed.get("medications"):
+        # If Claude returned nothing useful, return what we got with defaults
         return PrescriptionResponse(
-            diagnosis="Diagnosis pending physician review.",
+            diagnosis=parsed.get("diagnosis", "Diagnosis pending physician review."),
             medications=[],
-            notes=f"Based on consultation transcript.",
-            follow_up_days=7,
+            notes=parsed.get("notes", ""),
+            follow_up_days=parsed.get("follow_up_days", 14),
         )
 
-    # Parse medications carefully
+    # Build validated medications list
     meds = []
     for m in parsed.get("medications", []):
-        if isinstance(m, dict):
-            meds.append(Medication(
-                medication_name=m.get("medication_name", m.get("name", "")),
-                dosage=m.get("dosage", m.get("dose", "")),
-                frequency=m.get("frequency", ""),
-                duration=m.get("duration", ""),
-                route=m.get("route", "oral"),
-                instructions=m.get("instructions", m.get("special_instructions", "")),
-            ))
+        if not isinstance(m, dict):
+            continue
+        name = (m.get("medication_name") or m.get("name", "")).strip()
+        if not name:
+            continue
+        meds.append(Medication(
+            medication_name=name,
+            dosage=m.get("dosage", m.get("dose", "")),
+            frequency=m.get("frequency", ""),
+            duration=m.get("duration", ""),
+            route=m.get("route", "oral"),
+            instructions=m.get("instructions", m.get("special_instructions", "")),
+        ))
+
+    diagnosis = parsed.get("diagnosis", "").strip()
+    if not diagnosis:
+        diagnosis = "Diagnosis pending physician review."
+
+    notes = parsed.get("notes", parsed.get("additional_notes", "")).strip()
+    follow_up = parsed.get("follow_up_days", 14)
+    if isinstance(follow_up, str):
+        try:
+            follow_up = int(re.search(r'\d+', follow_up).group())
+        except:
+            follow_up = 14
+
+    print(f"[Rx] Final: {len(meds)} meds, diagnosis='{diagnosis[:60]}', follow_up={follow_up}d")
 
     return PrescriptionResponse(
-        diagnosis=parsed.get("diagnosis", ""),
+        diagnosis=diagnosis,
         medications=meds,
-        notes=parsed.get("notes", parsed.get("additional_notes", "")),
-        follow_up_days=parsed.get("follow_up_days", 7),
+        notes=notes,
+        follow_up_days=follow_up,
     )
 
 
+# ══════════════════════════════════════════════════════════════
+# SOAP NOTE ENDPOINT
+# ══════════════════════════════════════════════════════════════
+
+SOAP_SYSTEM = """You are an expert medical scribe AI. Your job is to analyze a doctor-patient consultation transcript and produce a structured SOAP note.
+
+You MUST output ONLY a valid JSON object. No markdown fences, no explanation — just raw JSON.
+
+The JSON schema is:
+{
+  "subjective": "Patient's chief complaint, history of present illness, symptoms described by the patient in their own words. Include onset, duration, severity, aggravating/relieving factors, and associated symptoms.",
+  "objective": "Clinical findings from physical examination, vital signs, lab results, and any observable data. Use proper medical terminology.",
+  "assessment": "Clinical diagnosis or differential diagnoses. Include severity. Be specific — 'Acute gastritis secondary to dietary factors' not just 'stomach issue'.",
+  "plan": "Treatment plan including medications prescribed (with dosages), lifestyle modifications, patient education, referrals, and follow-up schedule. Be detailed.",
+  "icd_codes": ["Array of relevant ICD-10 codes like 'K29.70' for gastritis"],
+  "follow_up_days": 14
+}
+
+RULES:
+1. Be thorough — include ALL relevant clinical information from the transcript.
+2. Use proper medical terminology and formatting.
+3. The subjective section should reflect what the patient reported, not clinical findings.
+4. The objective section should include examination findings AND vitals.
+5. The assessment should be a specific clinical diagnosis, not a symptom description.
+6. The plan should list specific medications with dosages, and all non-medication instructions.
+7. Include appropriate ICD-10 codes for the diagnoses mentioned.
+8. Extract the exact follow-up timeline from the transcript.
+"""
+
+
+@app.post("/api/soap", response_model=SOAPResponse)
+async def api_soap(req: SOAPRequest):
+    """Generate a SOAP note from a consultation transcript."""
+    p = req.patient
+    vitals = ", ".join(filter(None, [
+        f"BP {p.blood_pressure}" if p.blood_pressure else "",
+        f"HR {p.heart_rate} bpm" if p.heart_rate else "",
+        f"Temp {p.temperature}°F" if p.temperature else "",
+        f"SpO2 {p.oxygen_sat}%" if p.oxygen_sat else "",
+    ])) or "Not recorded"
+
+    allergies = ", ".join(p.allergies) if p.allergies else "No known allergies"
+
+    user_prompt = f"""Analyze this consultation transcript and create a SOAP note.
+
+PATIENT INFO:
+- Name: {p.full_name or 'Unknown'}
+- Age: {p.age or 'N/A'}
+- Gender: {p.gender or 'N/A'}
+- Vitals: {vitals}
+- Allergies: {allergies}
+- Medical History: {p.medical_history or 'Not provided'}
+
+CONSULTATION TRANSCRIPT:
+\"\"\"
+{req.transcript}
+\"\"\"
+
+Create a complete SOAP note. Output ONLY the JSON object:"""
+
+    try:
+        response_text = query_claude(SOAP_SYSTEM, user_prompt)
+        parsed = extract_json(response_text)
+        print(f"[SOAP] Claude extracted {len(parsed)} keys")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SOAP] Claude failed: {e}")
+        parsed = {}
+
+    # Validate — fall back to transcript for empty fields
+    subjective = (parsed.get("subjective") or "").strip()
+    if not subjective:
+        subjective = f"Patient reports: {req.transcript[:500]}"
+
+    objective = (parsed.get("objective") or "").strip()
+    if not objective:
+        objective = f"Vitals: {vitals}. Physical examination performed."
+
+    assessment = (parsed.get("assessment") or "").strip()
+    if not assessment:
+        assessment = "Assessment pending physician review."
+
+    plan = (parsed.get("plan") or "").strip()
+    if not plan:
+        plan = "Plan to be determined based on clinical findings."
+
+    icd_codes = parsed.get("icd_codes", [])
+    if isinstance(icd_codes, str):
+        icd_codes = [c.strip() for c in icd_codes.split(",") if c.strip()]
+
+    follow_up = parsed.get("follow_up_days", 14)
+    if isinstance(follow_up, str):
+        try:
+            follow_up = int(re.search(r'\d+', follow_up).group())
+        except:
+            follow_up = 14
+
+    return SOAPResponse(
+        subjective=subjective,
+        objective=objective,
+        assessment=assessment,
+        plan=plan,
+        icd_codes=icd_codes,
+        follow_up_days=follow_up,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# COMBINED ANALYSIS ENDPOINT
+# ══════════════════════════════════════════════════════════════
+
 @app.post("/api/analyze")
-async def analyze_transcript(req: PrescriptionRequest):
-    """General-purpose transcript analysis — returns both SOAP and prescription data."""
-
-    soap_req = SOAPRequest(transcript=req.transcript, patient=req.patient)
-    rx_req = req
-
-    soap = await generate_soap_note(soap_req)
-    prescription = await generate_prescription(rx_req)
-
-    return {
-        "soap": soap.model_dump(),
-        "prescription": prescription.model_dump(),
-    }
+async def api_analyze(req: PrescriptionRequest):
+    """Full analysis — returns both SOAP and prescription in one call."""
+    soap = await api_soap(SOAPRequest(transcript=req.transcript, patient=req.patient))
+    rx = await api_prescription(req)
+    return {"soap": soap.model_dump(), "prescription": rx.model_dump()}
 
 
-# ── Run Server ──
+# ══════════════════════════════════════════════════════════════
+# HEALTH CHECK
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/health")
+async def health():
+    if not ANTHROPIC_API_KEY:
+        return {"status": "error", "message": "ANTHROPIC_API_KEY not set"}
+    try:
+        # Quick validation — just check that the key format looks right
+        if not ANTHROPIC_API_KEY.startswith("sk-ant-"):
+            return {"status": "warning", "message": "API key format looks unusual"}
+        return {
+            "status": "ok",
+            "provider": "anthropic",
+            "model": MODEL,
+            "key_set": True,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════
+# SERVER
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n🏥 MedConnect AI Backend")
-    print("=" * 40)
-    print(f"Model: {MODEL}")
-    print(f"Ollama: {OLLAMA_URL}")
-    print(f"Server: http://localhost:8000")
-    print(f"Health: http://localhost:8000/health")
-    print("=" * 40)
-    print("\nMake sure Ollama is running: ollama serve")
-    print(f"Make sure model is pulled: ollama pull {MODEL}\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    print(f"\n🏥 MedConnect AI Backend v3 (Anthropic Claude)")
+    print("=" * 55)
+    print(f"  Model:     {MODEL}")
+    print(f"  API Key:   {'✓ Set' if ANTHROPIC_API_KEY else '✗ MISSING — set ANTHROPIC_API_KEY'}")
+    print(f"  Server:    http://localhost:8000")
+    print(f"  Health:    http://localhost:8000/health")
+    print(f"  Docs:      http://localhost:8000/docs")
+    print("=" * 55)
+
+    if not ANTHROPIC_API_KEY:
+        print("\n⚠️  ANTHROPIC_API_KEY not set!")
+        print("  Get one at: https://console.anthropic.com/settings/keys")
+        print("  Then run:   ANTHROPIC_API_KEY=sk-ant-xxx python server.py\n")
+
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
